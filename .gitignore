@@ -1,0 +1,32 @@
+.idea/
+# iOS/Android build artifacts
+Mobileprover.xcframework/
+Mobileprover.aar
+prover.aar
+Mobileprover-sources.jar
+prover-sources.jar
+
+# Cryptographic artifacts and generated keys
+circuit.r1cs
+proving_key.bin
+verifying_key.bin
+
+# Built binaries
+zktool
+
+# macOS
+.DS_Store
+
+# Go build / test artifacts
+bin/
+coverage.out
+*.test
+*.prof
+
+# Editor / OS files
+.vscode/
+*.swp
+*.swo
+
+
+bench
