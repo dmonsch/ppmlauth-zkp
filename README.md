@@ -48,10 +48,13 @@ Optional benchmarks
 go run ./cmd/bench -n 3
 ```
 
+The benchmark writes raw latency samples to `bench_raw_latencies.csv` by
+default. Use `-raw-out path/to/file.csv` to choose another file, or
+`-raw-out ""` to disable file output.
+
 Cleaning
 
 ```sh
 ./scripts/clean.sh
 ```
-
 

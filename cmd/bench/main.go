@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"math"
+	"os"
+	"strconv"
 	"time"
 
 	"ZKProofVerDec/circuit"
@@ -12,6 +15,7 @@ import (
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/backend/groth16"
+	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/constraint/solver"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
@@ -21,39 +25,153 @@ import (
 // Simple benchmark tool: compile circuit once, run setup once, then generate
 // N proofs measuring prove and verify time per iteration.
 func main() {
-	n := flag.Int("n", 5, "number of proofs to generate for benchmarking")
+	proofN := flag.Int(
+		"n",
+		5,
+		"number of proofs to generate for benchmarking",
+	)
+	compileN := flag.Int(
+		"compile-n",
+		100,
+		"number of circuit compilations to benchmark",
+	)
+	setupN := flag.Int(
+		"setup-n",
+		100,
+		"number of trusted setups to benchmark",
+	)
+	verbose := flag.Bool(
+		"verbose",
+		false,
+		"print timing for every compile and setup iteration",
+	)
+	rawOut := flag.String(
+		"raw-out",
+		"bench_raw_latencies.csv",
+		"path to write raw latency samples as CSV; empty disables file output",
+	)
 	flag.Parse()
 
-	fmt.Printf("Benchmarking proof generation and verification (n=%d)\n", *n)
-
-	var c circuit.CircuitVerDec
-
-	// Compile circuit
-	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &c)
-	if err != nil {
-		fmt.Println("compile error:", err)
+	if *proofN < 1 {
+		fmt.Println("-n must be at least 1")
+		return
+	}
+	if *compileN < 1 {
+		fmt.Println("-compile-n must be at least 1")
+		return
+	}
+	if *setupN < 1 {
+		fmt.Println("-setup-n must be at least 1")
 		return
 	}
 
-	fmt.Println("Running trusted setup (Groth16)...")
-	pk, vk, err := groth16.Setup(ccs)
-	if err != nil {
-		fmt.Println("setup error:", err)
-		return
+	fmt.Printf(
+		"Benchmark configuration: compile=%d, setup=%d, prove/verify=%d\n",
+		*compileN,
+		*setupN,
+		*proofN,
+	)
+	if *rawOut != "" {
+		fmt.Printf("Raw latency output: %s\n", *rawOut)
 	}
 
-	// Prepare options
+	var compileTimes []time.Duration
+	var setupTimes []time.Duration
+	var proveTimes []time.Duration
+	var verifyTimes []time.Duration
+
+	/*
+		Compile benchmark.
+
+		Each iteration creates and compiles a fresh circuit value. The final
+		constraint system is retained for the setup and proving benchmarks.
+	*/
+	var ccs constraint.ConstraintSystem
+
+	fmt.Printf("\nBenchmarking circuit compilation (%d iterations)...\n", *compileN)
+
+	for i := 0; i < *compileN; i++ {
+		var c circuit.CircuitVerDec
+
+		start := time.Now()
+		compiledCCS, err := frontend.Compile(
+			ecc.BN254.ScalarField(),
+			r1cs.NewBuilder,
+			&c,
+		)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			fmt.Printf("compile iteration %d failed: %v\n", i+1, err)
+			return
+		}
+
+		compileTimes = append(compileTimes, elapsed)
+		ccs = compiledCCS
+
+		if *verbose {
+			fmt.Printf(
+				"  compile %d/%d: %s\n",
+				i+1,
+				*compileN,
+				elapsed,
+			)
+		}
+	}
+
+	/*
+		Trusted-setup benchmark.
+
+		The same compiled constraint system is used for every iteration so
+		this measures setup independently of compilation.
+
+		The final key pair is retained for the prove/verify benchmark.
+	*/
+	var pk groth16.ProvingKey
+	var vk groth16.VerifyingKey
+
+	fmt.Printf("\nBenchmarking trusted setup (%d iterations)...\n", *setupN)
+
+	for i := 0; i < *setupN; i++ {
+		start := time.Now()
+		generatedPK, generatedVK, err := groth16.Setup(ccs)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			fmt.Printf("setup iteration %d failed: %v\n", i+1, err)
+			return
+		}
+
+		setupTimes = append(setupTimes, elapsed)
+
+		// Keep the most recently generated matching key pair.
+		pk = generatedPK
+		vk = generatedVK
+
+		if *verbose {
+			fmt.Printf(
+				"  setup %d/%d: %s\n",
+				i+1,
+				*setupN,
+				elapsed,
+			)
+		}
+	}
+
+	// Prepare prover options.
 	solverHints := solver.WithHints(circuit.ModuloHint)
 	proverOption := backend.WithSolverOptions(
 		solverHints,
 		solver.WithLogger(zerolog.Nop()),
 	)
 
-	var proveTimes []time.Duration
-	var verifyTimes []time.Duration
+	fmt.Printf(
+		"\nBenchmarking proof generation and verification (%d iterations)...\n",
+		*proofN,
+	)
 
-	for i := 0; i < *n; i++ {
-		fmt.Printf("Iteration %d/%d\n", i+1, *n)
+	for i := 0; i < *proofN; i++ {
+		fmt.Printf("Iteration %d/%d\n", i+1, *proofN)
 
 		wstruct, err := witness.BuildWitness()
 		if err != nil {
@@ -61,47 +179,65 @@ func main() {
 			return
 		}
 
-		witnessFull, err := frontend.NewWitness(&wstruct, ecc.BN254.ScalarField())
+		witnessFull, err := frontend.NewWitness(
+			&wstruct,
+			ecc.BN254.ScalarField(),
+		)
 		if err != nil {
 			fmt.Println("witness creation error:", err)
 			return
 		}
 
-		// Prove
-		t0 := time.Now()
-		proof, err := groth16.Prove(ccs, pk, witnessFull, proverOption)
+		// Prove.
+		start := time.Now()
+		proof, err := groth16.Prove(
+			ccs,
+			pk,
+			witnessFull,
+			proverOption,
+		)
+		proveTime := time.Since(start)
+
 		if err != nil {
 			fmt.Println("prove error:", err)
 			return
 		}
-		proveTime := time.Since(t0)
+
 		proveTimes = append(proveTimes, proveTime)
 		fmt.Printf("  prove time: %s\n", proveTime)
 
-		// Verify using public witness
-		pubW, err := witnessFull.Public()
+		// Extract the public witness outside the verification timer.
+		publicWitness, err := witnessFull.Public()
 		if err != nil {
 			fmt.Println("public witness error:", err)
 			return
 		}
 
-		t1 := time.Now()
-		if err := groth16.Verify(proof, vk, pubW); err != nil {
+		// Verify.
+		start = time.Now()
+		err = groth16.Verify(proof, vk, publicWitness)
+		verifyTime := time.Since(start)
+
+		if err != nil {
 			fmt.Println("verify failed:", err)
 			return
 		}
-		verifyTime := time.Since(t1)
+
 		verifyTimes = append(verifyTimes, verifyTime)
 		fmt.Printf("  verify time: %s\n", verifyTime)
 	}
 
 	printStats := func(label string, ds []time.Duration) {
-		mean, lower, upper, halfWidth, ok := meanConfidenceInterval95(ds)
+		mean, lower, upper, halfWidth, ok :=
+			meanConfidenceInterval95(ds)
 
 		fmt.Printf("  %s avg: %s\n", label, mean)
 
 		if !ok {
-			fmt.Printf("  %s 95%% CI: unavailable, need at least 2 samples\n", label)
+			fmt.Printf(
+				"  %s 95%% CI: unavailable, need at least 2 samples\n",
+				label,
+			)
 			return
 		}
 
@@ -115,8 +251,81 @@ func main() {
 	}
 
 	fmt.Println("\nResults:")
+	printStats("compile", compileTimes)
+	printStats("setup", setupTimes)
 	printStats("prove", proveTimes)
 	printStats("verify", verifyTimes)
+
+	if *rawOut != "" {
+		if err := writeRawLatencies(
+			*rawOut,
+			compileTimes,
+			setupTimes,
+			proveTimes,
+			verifyTimes,
+		); err != nil {
+			fmt.Println("write raw latency file error:", err)
+			return
+		}
+
+		fmt.Printf("\nRaw latencies written to %s\n", *rawOut)
+	}
+}
+
+func writeRawLatencies(
+	path string,
+	compileTimes []time.Duration,
+	setupTimes []time.Duration,
+	proveTimes []time.Duration,
+	verifyTimes []time.Duration,
+) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+
+	if err := writer.Write([]string{
+		"phase",
+		"iteration",
+		"latency_ns",
+		"latency",
+	}); err != nil {
+		return err
+	}
+
+	writeSamples := func(phase string, samples []time.Duration) error {
+		for i, sample := range samples {
+			if err := writer.Write([]string{
+				phase,
+				strconv.Itoa(i + 1),
+				strconv.FormatInt(sample.Nanoseconds(), 10),
+				sample.String(),
+			}); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	if err := writeSamples("compile", compileTimes); err != nil {
+		return err
+	}
+	if err := writeSamples("setup", setupTimes); err != nil {
+		return err
+	}
+	if err := writeSamples("prove", proveTimes); err != nil {
+		return err
+	}
+	if err := writeSamples("verify", verifyTimes); err != nil {
+		return err
+	}
+
+	writer.Flush()
+	return writer.Error()
 }
 
 // meanConfidenceInterval95 returns the sample mean and a two-sided 95%
